@@ -59,6 +59,7 @@ function easy_breadcrumb_theme($existing, $type, $theme, $path) {
         'breadcrumb' => NULL,
         'segments_quantity' => NULL,
         'separator' => NULL,
+        'separator_ending' => NULL,
       ),
       'template' => 'easy-breadcrumb',
       'path' => drupal_get_path('module', 'easy_breadcrumb') . '/tpl',
@@ -99,18 +100,28 @@ function easy_breadcrumb_block_view($delta = NULL) {
  */
 function template_preprocess_easy_breadcrumb(&$variables) {
   $breadcrumbs = _easy_breadcrumb_build_items();
+  if (module_exists('schemaorg')) {
+    $variables['list_type'] = 'https://schema.org/BreadcrumbList';
+  }
+  else {
+    $variables['list_type'] = 'http://data-vocabulary.org/Breadcrumb';
+  }
   foreach ($breadcrumbs as $i => $breadcrumb) {
     $content = decode_entities($breadcrumb['content']);
     if (isset($breadcrumb['url'])) {
-      $variables['breadcrumb'][$i] = l($content, $breadcrumb['url'], array(
+      $variables['breadcrumb'][$i] = '<span itemprop="title">';
+      $variables['breadcrumb'][$i] .= l($content, $breadcrumb['url'], array(
         'attributes' => array('class' => $breadcrumb['class'])
       ));
-    } else {
+      $variables['breadcrumb'][$i] .= '</span>';
+    }
+    else {
       $class = implode(' ', $breadcrumb['class']);
-      $variables['breadcrumb'][$i] = '<span class="' . $class . '">' . check_plain($content) . '</span>';
+      $variables['breadcrumb'][$i] = '<span class="' . $class . '" itemprop="title">' . check_plain($content) . '</span>';
     }
   }
   $variables['segments_quantity'] = count($variables['breadcrumb']);
+  $variables['seperator_ending'] = variable_get(EasyBreadcrumbConstants::DB_VAR_SEPERATOR_ENDING, FALSE) ? 0 : 1;
   $variables['separator'] = filter_xss(variable_get(EasyBreadcrumbConstants::DB_VAR_SEGMENTS_SEPARATOR, '>>'));
 }
 
@@ -156,8 +167,26 @@ function _easy_breadcrumb_build_items() {
     // Obtains the alias of the current path.
     $alias = drupal_get_path_alias();
 
+    // We need to pass our path through hook_url_outbound_alter(). This fixes
+    // clean URLs not working when they don't exist in the {url_alias} table and
+    // are created with something like subpathauto.
+    $normalized_path = current_path();
+
+    // hook_url_outbound_alter() expects defaults in url() options.
+    $options = array(
+      'fragment' => '',
+      'query' => array(),
+      'absolute' => FALSE,
+      'alias' => FALSE,
+      'prefix' => '',
+      'external' => FALSE,
+    );
+
+    drupal_alter('url_outbound', $alias, $options, $normalized_path);
+
     // Allow the alias to be altered.
     drupal_alter('easy_breadcrumb_path', $alias);
+
 
     // Get the segments of the current path.
     $alias_arr = explode('/', $alias);
@@ -278,6 +307,14 @@ function _easy_breadcrumb_obtain_page_title($page_text) {
  *   the generated breadcrumb item.
  */
 function _easy_breadcrumb_build_item($item_title, $item_classes, $item_url, $as_link = TRUE) {
+  if (variable_get(EasyBreadcrumbConstants::DB_VAR_TRUNCATOR_MODE, FALSE)) {
+    $item_title = truncate_utf8(
+      $item_title,
+      variable_get(EasyBreadcrumbConstants::DB_VAR_TRUNCATOR_LENGTH, 100),
+      TRUE,
+      variable_get(EasyBreadcrumbConstants::DB_VAR_TRUNCATOR_DOTS, TRUE)
+    );
+  }
   $item = array('content' => $item_title, 'class' => $item_classes);
   if ($as_link) {
     $item['url'] = $item_url;
@@ -344,7 +381,10 @@ function _easy_breadcrumb_obtain_segment_title($normal_path, $valid_path, $segme
   // If path is valid then try to obtain the title from the menu router (if available).
   if ($valid_path) {
     $router_item = menu_get_item($normal_path);
-    $title = $router_item['title'];
+    // If not using segment text as title then use the menu router title.
+    if (!variable_get(EasyBreadcrumbConstants::DB_VAR_SEGMENT_TEXT_AS_TITLE, FALSE)) {
+      $title = $router_item['title'];
+    }
   }
   // Just infer the title from the segment text.
   if (!isset($title) || $title === '') {
@@ -370,7 +410,6 @@ function _easy_breadcrumb_normalize_text($raw_text) {
 
   // Gets the flag saying the capitalizator mode.
   $capitalizator_mode = variable_get(EasyBreadcrumbConstants::DB_VAR_CAPITALIZATOR_MODE, 'ucwords');
-
   if ($capitalizator_mode === 'ucwords') {
     // Transforms the text 'once a time' to 'Once a Time'.
     // List of words to be ignored by the capitalizator.
@@ -385,7 +424,40 @@ function _easy_breadcrumb_normalize_text($raw_text) {
       }
     }
     $normalized_text = join(' ', $words_arr);
-  } else {
+  }
+  elseif ($capitalizator_mode === 'ucall') {
+    // Transforms the text 'once a time' to 'ONCE A TIME'.
+    $normalized_text = drupal_strtoupper($normalized_text);
+  }
+  elseif ($capitalizator_mode === 'ucforce') {
+    // Transforms the text 'once a time' to 'once a TIME'.
+    // List of words to be forced by the capitalizator.
+    $forced_words = variable_get(EasyBreadcrumbConstants::DB_VAR_CAPITALIZATOR_FORCED_WORDS, '');
+    // If case sensitivity is false make all the forced words uncapitalized by default.
+    if (!variable_get(EasyBreadcrumbConstants::DB_VAR_CAPITALIZATOR_FORCED_WORDS_CASE_SENSITIVITY, FALSE)) {
+      $forced_words = array_map('drupal_strtolower', $forced_words);
+    }
+    $words_arr = explode(' ', $normalized_text);
+    // Transforms the non-ignored words of the segment.
+    if (variable_get(EasyBreadcrumbConstants::DB_VAR_CAPITALIZATOR_FORCED_WORDS_FIRST_LETTER, '')) {
+      $words_arr[0] = drupal_ucfirst($words_arr[0]);
+    }
+    for ($idx_1 = 0, $words_quantity = count($words_arr); $idx_1 < $words_quantity; ++$idx_1) {
+    // If case sensitivity is false make the compared word uncapitalized in order to allow the comparison well.
+      if (!variable_get(EasyBreadcrumbConstants::DB_VAR_CAPITALIZATOR_FORCED_WORDS_CASE_SENSITIVITY, FALSE)) {
+        $selected_word = drupal_strtolower($words_arr[$idx_1]);
+      }
+      else {
+        $selected_word = $words_arr[$idx_1];
+      }
+      // Transforms this word only if it is in the list of forced words.
+      if (in_array($selected_word, $forced_words)) {
+        $words_arr[$idx_1] = drupal_strtoupper($selected_word);
+      }
+    }
+    $normalized_text = join(' ', $words_arr);
+  }
+  else {
     // Transforms the text 'once a time' to 'Once a time' (ucfirst).
     $normalized_text = drupal_ucfirst($normalized_text);
   }
